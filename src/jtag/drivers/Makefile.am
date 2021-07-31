@@ -156,6 +156,7 @@ DRIVERFILES += %D%/sysfsgpio.c
 endif
 if XLNX_PCIE_XVC
 DRIVERFILES += %D%/xlnx-pcie-xvc.c
+DRIVERFILES += %D%/xlnx-tcp-xvc.c
 endif
 if BCM2835GPIO
 DRIVERFILES += %D%/bcm2835gpio.c

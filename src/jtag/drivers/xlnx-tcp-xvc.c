@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <arpa/inet.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 
 #include <helper/bits.h>
@@ -22,17 +23,38 @@
 #include <jtag/interface.h>
 #include <jtag/commands.h>
 
+#define MAP_SIZE		0x10000
+#define PROGRESS_BEGIN		(1024 * 512 * 8)
 #define XLNX_XVC_REG_SIZE	0x20
+
+struct jtag_xvc_uio {
+  uint32_t  length;
+  uint32_t  tms;
+  uint32_t  tdi;
+  uint32_t  tdo;
+  uint32_t  enable;
+};
+
+enum xvc_interface {
+	XVC_IF_NONE,
+	XVC_IF_TCP,
+	XVC_IF_UIO
+};
 
 struct xlnx_tcp_xvc {
 	int fd;
 	int port;
+	int uio_dev;
 	char *ip_addr;
 	uint8_t *command;
 	size_t vector_len;
 	size_t command_len;
 	size_t command_size;
 	struct sockaddr_in serv_addr;
+	enum xvc_interface interface;
+	volatile struct jtag_xvc_uio *jtag_mmap;
+	int (*transact)(size_t num_bits, uint32_t *tms,
+			   uint32_t *tdi, uint32_t *tdo);
 };
 
 static struct xlnx_tcp_xvc xlnx_tcp_xvc_state;
@@ -82,6 +104,34 @@ static int xlnx_tcp_xvc_transact(size_t num_bits, uint32_t *tms, uint32_t *tdi,
 	return ERROR_OK;
 }
 
+static int xlnx_uio_xvc_transact(size_t num_bits, uint32_t *tms, uint32_t *tdi,
+				 uint32_t *tdo)
+{
+	volatile struct jtag_xvc_uio *jtag_mmap = xlnx_tcp_xvc->jtag_mmap;
+
+	if (!num_bits) {
+		LOG_WARNING("Can not shift 0 bits. Skip.");
+		return ERROR_FAIL;
+	}
+
+	if (num_bits > XLNX_XVC_REG_SIZE) {
+		LOG_ERROR("Too many bits to shift %zu, %s can shift only %d",
+			  num_bits, __func__, XLNX_XVC_REG_SIZE);
+		return ERROR_FAIL;
+	}
+
+	jtag_mmap->length = num_bits;
+	jtag_mmap->tms = *tms;
+	jtag_mmap->tdi = *tdi;
+	jtag_mmap->enable = 1;
+
+	while (jtag_mmap->enable) { };
+
+	*tdo = jtag_mmap->tdo;
+
+	return ERROR_OK;
+}
+
 static int xlnx_tcp_xvc_execute_stableclocks(struct jtag_command *cmd)
 {
 	uint32_t tms = tap_get_state() == TAP_RESET ? 1 : 0;
@@ -95,7 +145,7 @@ static int xlnx_tcp_xvc_execute_stableclocks(struct jtag_command *cmd)
 
 	while (left) {
 		write = MIN(XLNX_XVC_REG_SIZE, left);
-		err = xlnx_tcp_xvc_transact(write, &tms, &tdi, &tdo);
+		err = xlnx_tcp_xvc->transact(write, &tms, &tdi, &tdo);
 		if (err != ERROR_OK)
 			return err;
 		left -= write;
@@ -119,7 +169,7 @@ static int xlnx_tcp_xvc_execute_statemove(size_t skip)
 		  tap_state_name(tap_get_state()),
 		  tap_state_name(tap_get_end_state()));
 
-	err = xlnx_tcp_xvc_transact(tms_count - skip, &tms, &tdi, &tdo);
+	err = xlnx_tcp_xvc->transact(tms_count - skip, &tms, &tdi, &tdo);
 	if (err != ERROR_OK)
 		return err;
 
@@ -153,7 +203,7 @@ static int xlnx_tcp_xvc_execute_runtest(struct jtag_command *cmd)
 
 	while (left) {
 		write = MIN(XLNX_XVC_REG_SIZE, left);
-		err = xlnx_tcp_xvc_transact(write, &tms, &tdi, &tdo);
+		err = xlnx_tcp_xvc->transact(write, &tms, &tdi, &tdo);
 		if (err != ERROR_OK)
 			return err;
 		left -= write;
@@ -183,9 +233,9 @@ static int xlnx_tcp_xvc_execute_pathmove(struct jtag_command *cmd)
 	for (i = 0; i < num_states; i++) {
 		if (path[i] == tap_state_transition(tap_get_state(), false)) {
 			tms = 1;
-			err = xlnx_tcp_xvc_transact(1, &tms, &tdi, &tdo);
+			err = xlnx_tcp_xvc->transact(1, &tms, &tdi, &tdo);
 		} else if (path[i] == tap_state_transition(tap_get_state(), true)) {
-			err = xlnx_tcp_xvc_transact(1, &tms, &tdi, &tdo);
+			err = xlnx_tcp_xvc->transact(1, &tms, &tdi, &tdo);
 		} else {
 			LOG_ERROR("BUG: %s -> %s isn't a valid TAP transition.",
 				  tap_state_name(tap_get_state()),
@@ -259,7 +309,7 @@ static int xlnx_tcp_xvc_execute_scan(struct jtag_command *cmd)
 			tms_buff[last_byte] = BIT(last_bit);
 			LOG_DEBUG("write %zu last_byte %zu last_bit %zu", write, last_byte, last_bit);
 		}
-		err = xlnx_tcp_xvc_transact(write, (uint32_t *) tms_buff, (uint32_t *) rd_ptr, (uint32_t *) rd_ptr);
+		err = xlnx_tcp_xvc->transact(write, (uint32_t *) tms_buff, (uint32_t *) rd_ptr, (uint32_t *) rd_ptr);
 		if (err != ERROR_OK)
 			goto out_err;
 		left -= write;
@@ -315,7 +365,7 @@ static int xlnx_tcp_xvc_execute_tms(struct jtag_command *cmd)
 	while (left) {
 		write = MIN(XLNX_XVC_REG_SIZE, left);
 		tms = buf_get_u32(bits, 0, write);
-		err = xlnx_tcp_xvc_transact(write, &tms, &tdi, &tdo);
+		err = xlnx_tcp_xvc->transact(write, &tms, &tdi, &tdo);
 		if (err != ERROR_OK)
 			return err;
 		left -= write;
@@ -379,6 +429,16 @@ static int xlnx_tcp_xvc_init(void)
 	char buffer[1024] = {0};
 	char *vector_len_begin;
 	int nbytes;
+	int fd_uio;
+
+	if (xlnx_tcp_xvc->interface != XVC_IF_TCP &&
+	    xlnx_tcp_xvc->interface != XVC_IF_UIO) {
+	    LOG_ERROR("xlnx_xvc_interface_config must be TCP or UIO");
+	    return ERROR_JTAG_INIT_FAILED;
+	}
+
+	if (xlnx_tcp_xvc->interface == XVC_IF_UIO)
+		goto xvc_init_uio;
 
 	xlnx_tcp_xvc->fd = socket(AF_INET, SOCK_STREAM, 0);
 	if ((xlnx_tcp_xvc->fd) < 0) {
@@ -393,6 +453,7 @@ static int xlnx_tcp_xvc_init(void)
 		LOG_ERROR("Invalid IP address.");
 		return ERROR_JTAG_INIT_FAILED;
 	}
+
 	if (connect(xlnx_tcp_xvc->fd, (struct sockaddr *) &xlnx_tcp_xvc->serv_addr, sizeof(xlnx_tcp_xvc->serv_addr)) <
 	    0) {
 		LOG_ERROR("Cannot connect to server.");
@@ -408,6 +469,32 @@ static int xlnx_tcp_xvc_init(void)
 	xlnx_tcp_xvc->command_size = xlnx_tcp_xvc->vector_len / 8 * 2 + 10;
 	xlnx_tcp_xvc->command = malloc(xlnx_tcp_xvc->command_size);
 	LOG_INFO("Successfully connected to server. Server info: %s", buffer);
+
+	xlnx_tcp_xvc->transact = xlnx_tcp_xvc_transact;
+
+	return ERROR_OK;
+
+xvc_init_uio:
+	sprintf(buffer,"/dev/uio%d", xlnx_tcp_xvc->uio_dev);
+	fd_uio = open(buffer, O_RDWR );
+		if (fd_uio < 1) {
+		LOG_ERROR("Failed to Open UIO device");
+		return ERROR_JTAG_INIT_FAILED;
+	}
+
+	xlnx_tcp_xvc->jtag_mmap = (volatile struct jtag_xvc_uio*)
+		mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
+		     MAP_SHARED, fd_uio, 0);
+
+	if (xlnx_tcp_xvc->jtag_mmap == MAP_FAILED) {
+		LOG_ERROR("Failed to MMAP UIO device");
+		return ERROR_JTAG_INIT_FAILED;
+	}
+
+	xlnx_tcp_xvc->vector_len = XLNX_XVC_REG_SIZE;
+	xlnx_tcp_xvc->transact = xlnx_uio_xvc_transact;
+
+	close(fd_uio);
 
 	return ERROR_OK;
 }
@@ -451,6 +538,62 @@ COMMAND_HANDLER(xlnx_xvc_port_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(xlnx_xvc_uio_dev_command)
+{
+	int ret;
+
+	if (CMD_ARGC < 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	ret = sscanf(CMD_ARGV[0], "%i", &xlnx_tcp_xvc->uio_dev);
+	if (ret != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (xlnx_tcp_xvc->uio_dev < 0) {
+		LOG_ERROR("xlnx_xvc_uio_dev_config should be greater than 0");
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(xlnx_xvc_interface_command)
+{
+	char interface[4];
+	size_t i;
+	int ret;
+
+	if (CMD_ARGC < 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (strlen(CMD_ARGV[0]) != 3)
+		goto xlnx_xvc_interface_config_err;
+
+	ret = sscanf(CMD_ARGV[0], "%s", interface);
+	if (ret != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	for(i=0; i < strlen(interface); i++)
+		interface[i] = toupper(interface[i]);
+
+	xlnx_tcp_xvc->interface = XVC_IF_NONE;
+
+	if (!strcmp(interface, "UIO"))
+		xlnx_tcp_xvc->interface = XVC_IF_UIO;
+
+	if (!strcmp(interface, "TCP"))
+		xlnx_tcp_xvc->interface = XVC_IF_TCP;
+
+	if (xlnx_tcp_xvc->interface == XVC_IF_NONE)
+		goto xlnx_xvc_interface_config_err;
+
+	return ERROR_OK;
+
+xlnx_xvc_interface_config_err:
+	LOG_ERROR("xlnx_xvc_interface_config must be TCP or UIO");
+	return ERROR_COMMAND_SYNTAX_ERROR;
+}
+
 static const struct command_registration xlnx_tcp_xvc_command_handlers[] = {
 	{
 		.name = "xlnx_xvc_ip",
@@ -464,6 +607,20 @@ static const struct command_registration xlnx_tcp_xvc_command_handlers[] = {
 		.handler = xlnx_xvc_port_command,
 		.mode = COMMAND_CONFIG,
 		.help = "Configure XVC server TCP port",
+		.usage = "device",
+	},
+	{
+		.name = "xlnx_xvc_uio_dev",
+		.handler = xlnx_xvc_uio_dev_command,
+		.mode = COMMAND_CONFIG,
+		.help = "Configure XVC uio dev id",
+		.usage = "device",
+	},
+	{
+		.name = "xlnx_xvc_interface",
+		.handler = xlnx_xvc_interface_command,
+		.mode = COMMAND_CONFIG,
+		.help = "Configure XVC interface(UIO or TCP)",
 		.usage = "device",
 	},
 	COMMAND_REGISTRATION_DONE

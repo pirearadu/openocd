@@ -50,6 +50,7 @@ struct xlnx_tcp_xvc {
 	size_t vector_len;
 	size_t command_len;
 	size_t command_size;
+	size_t custom_vector_len;
 	struct sockaddr_in serv_addr;
 	enum xvc_interface interface;
 	volatile struct jtag_xvc_uio *jtag_mmap;
@@ -463,12 +464,17 @@ static int xlnx_tcp_xvc_init(void)
 	send(xlnx_tcp_xvc->fd, message, strlen(message), 0);
 	nbytes = read(xlnx_tcp_xvc->fd, buffer, 1024);
 	buffer[nbytes - 1] = 0;
-
+	LOG_INFO("Successfully connected to XVC server.");
+	LOG_INFO("Server info: %s", buffer);
 	vector_len_begin = strchr(buffer, ':') + 1;
 	sscanf(vector_len_begin, "%zu", &xlnx_tcp_xvc->vector_len);
+	LOG_INFO("Server vector length: %zu", xlnx_tcp_xvc->vector_len);
+	if (xlnx_tcp_xvc->custom_vector_len) {
+		xlnx_tcp_xvc->vector_len  = xlnx_tcp_xvc->custom_vector_len;
+		LOG_INFO("Override vector length: %zu", xlnx_tcp_xvc->vector_len);
+	}
 	xlnx_tcp_xvc->command_size = xlnx_tcp_xvc->vector_len / 8 * 2 + 10;
 	xlnx_tcp_xvc->command = malloc(xlnx_tcp_xvc->command_size);
-	LOG_INFO("Successfully connected to server. Server info: %s", buffer);
 
 	xlnx_tcp_xvc->transact = xlnx_tcp_xvc_transact;
 
@@ -534,6 +540,28 @@ COMMAND_HANDLER(xlnx_xvc_port_command)
 	ret = sscanf(CMD_ARGV[0], "%i", &xlnx_tcp_xvc->port);
 	if (ret != 1)
 		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(xlnx_xvc_vector_length_command)
+{
+	int custom_vector_len;
+	int ret;
+
+	if (CMD_ARGC < 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	ret = sscanf(CMD_ARGV[0], "%i", &custom_vector_len);
+	if (ret != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (custom_vector_len <= 0) {
+		LOG_ERROR("xlnx_xvc_vector_length should be greather than 0.");
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+
+	xlnx_tcp_xvc->custom_vector_len = custom_vector_len;
 
 	return ERROR_OK;
 }
@@ -607,6 +635,13 @@ static const struct command_registration xlnx_tcp_xvc_command_handlers[] = {
 		.handler = xlnx_xvc_port_command,
 		.mode = COMMAND_CONFIG,
 		.help = "Configure XVC server TCP port",
+		.usage = "device",
+	},
+	{
+		.name = "xlnx_xvc_vector_length",
+		.handler = xlnx_xvc_vector_length_command,
+		.mode = COMMAND_CONFIG,
+		.help = "Configure XVC server vector length(in bits) and override the reported one.",
 		.usage = "device",
 	},
 	{
